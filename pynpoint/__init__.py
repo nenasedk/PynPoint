@@ -21,7 +21,8 @@ from pynpoint.processing.basic import SubtractImagesModule, \
 from pynpoint.processing.centering import StarAlignmentModule, \
                                           FitCenterModule, \
                                           ShiftImagesModule, \
-                                          WaffleCenteringModule
+                                          WaffleCenteringModule,\
+                                          SatelliteSpotExtractModule
 
 from pynpoint.processing.darkflat import DarkCalibrationModule, \
                                          FlatCalibrationModule

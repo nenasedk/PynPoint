@@ -805,3 +805,278 @@ class WaffleCenteringModule(ProcessingModule):
         self.m_image_out_port.copy_attributes(self.m_image_in_port)
         self.m_image_out_port.add_history('WaffleCenteringModule', history)
         self.m_image_out_port.close_port()
+
+class SatelliteSpotExtractModule(ProcessingModule):
+    """
+    Pipeline module for extracting PSFs of the satellite spots in IFS data.
+    """
+
+    __author__ = 'Alexander Bohn'
+
+    @typechecked
+    def __init__(self,
+                 name_in: str,
+                 image_in_tag: str,
+                 center_in_tag: str,
+                 image_out_tag: str,
+                 size: Optional[float] = None,
+                 center: Optional[Tuple[float, float]] = None,
+                 radius: float = 45.,
+                 pattern: str = None,
+                 angle: float = 45.,
+                 sigma: float = 0.06,
+                 dither: bool = False,
+                 combine: str = None) -> None:
+        """
+        Parameters
+        ----------
+        name_in : str
+            Unique name of the module instance.
+        image_in_tag : str
+            Tag of the database entry with science images that are read as input.
+        center_in_tag : str
+            Tag of the database entry with the center frame that is read as input.
+        image_out_tag : str
+            Tag of the database entry with the centered images that are written as output. Should
+            be different from *image_in_tag*.
+        size : float, None
+            Image size px for both dimensions.
+        center : tuple(float, float), None
+            Approximate position (x0, y0) of the coronagraph. The center of the image is used if
+            set to None.
+        radius : float
+            Approximate separation (pix) of the satellite spots from the star. For IFS data, the
+            separation of the spots in the image with the shortest wavelength is required.
+        pattern : str, None
+            Waffle pattern that is used ('x' or '+'). This parameter will be deprecated in a future
+            release. Please use the ``angle`` parameter instead. The parameter will be ignored if
+            set to None.
+        angle : float
+            Angle offset (deg) in clockwise direction of the satellite spots with respect to the
+            '+' orientation (i.e. when the spots are located along the horizontal and vertical
+            axis). The previous use of the '+' pattern corresponds to 0 degrees and 'x' pattern
+            corresponds to 45 degrees. SPHERE/IFS data requires an angle of 55.48 degrees.
+        sigma : float
+            Standard deviation (arcsec) of the Gaussian kernel that is used for the unsharp
+            masking.
+        dither : bool
+            Apply dithering correction based on the ``DITHER_X`` and ``DITHER_Y`` attributes.
+        combine : str
+            Combine waffle spots with 'median', 'mean', or keep all spots separately ( None ).
+
+        Returns
+        -------
+        NoneType
+            None
+        """
+
+        super().__init__(name_in)
+
+        self.m_image_in_port = self.add_input_port(image_in_tag)
+        self.m_center_in_port = self.add_input_port(center_in_tag)
+        self.m_image_out_port = self.add_output_port(image_out_tag)
+
+        self.m_size = size
+        self.m_center = center
+        self.m_radius = radius
+        self.m_pattern = pattern
+        self.m_angle = angle
+        self.m_sigma = sigma
+        self.m_dither = dither
+        self.combine = combine
+
+    @typechecked
+    def run(self) -> None:
+        """
+        Run method of the module. Locates the position of the calibration spots in the center
+        frame. From the four spots, the position of the star behind the coronagraph is fitted,
+        and the images are shifted and cropped.
+
+        Returns
+        -------
+        NoneType
+            None
+        """
+
+        @typechecked
+        def _get_center(wave_nr: int,
+                        ang_nr: int,
+                        center: Optional[Tuple[int, int]]) -> Tuple[np.ndarray, Tuple[int, int]]:
+
+            center_frame = self.m_center_in_port[wave_nr,ang_nr,]
+
+            if center is None:
+                center = center_pixel(center_frame)
+            else:
+                center = (int(np.floor(center[0])), int(np.floor(center[1])))
+
+            return center_frame, center
+
+        center_shape = self.m_center_in_port.get_shape()
+        im_shape = self.m_image_in_port.get_shape()
+        ndim = self.m_image_in_port.get_ndim()
+
+        # Read in wavelength information or set it to default values
+        if ndim == 4:
+            wavelength = self.m_image_in_port.get_attribute('WAVELENGTH')
+
+            if wavelength is None:
+                raise ValueError('The wavelength information is required to centre IFS data. '
+                                 'Please add it via the WavelengthReadingModule before using '
+                                 'the WaffleCenteringModule.')
+
+            if im_shape[0] != center_shape[0]:
+                raise ValueError(f'Number of science wavelength channels: {im_shape[0]}. '
+                                 f'Number of center wavelength channels: {center_shape[0]}. '
+                                 'Exactly one center image per wavelength is required.')
+
+            wavelength_min = np.min(wavelength)
+
+        elif ndim == 3:
+            # for none ifs data, use default value
+            wavelength = [1.]
+            wavelength_min = 1.
+
+        # check if science and center images have the same shape
+        if im_shape[-2:] != center_shape[-2:]:
+            raise ValueError('Science and center images should have the same shape.')
+
+
+        pixscale = self.m_image_in_port.get_attribute('PIXSCALE')
+
+        if self.m_dither:
+            dither_x = self.m_image_in_port.get_attribute('DITHER_X')
+            dither_y = self.m_image_in_port.get_attribute('DITHER_Y')
+
+            nframes = self.m_image_in_port.get_attribute('NFRAMES')
+            nframes = np.cumsum(nframes)
+            nframes = np.insert(nframes, 0, 0)
+
+        # size of center image, only works with odd value
+        ref_image_size = self.m_size
+
+        # Arrays for the positions
+        x_pos = np.zeros(4)
+        y_pos = np.zeros(4)
+
+        start_time = time.time()
+        if self.m_center is None:
+            self.m_center = (int(im_shape[2]/2), int(im_shape[3]/2))
+        if self.combine is None:
+            sat_spots = np.zeros((im_shape[0],im_shape[1],4,ref_image_size,ref_image_size))
+        else: 
+            sat_spots = np.zeros((im_shape[0],im_shape[1],ref_image_size,ref_image_size))
+        for w, wave_nr in enumerate(wavelength):
+            progress(w, len(wavelength), 'Extracting Satellite Spots...', start_time)
+            if self.combine is None:
+                sat_spots_wlen = np.zeros((im_shape[1],4,ref_image_size,ref_image_size))
+            else: 
+                sat_spots_wlen = np.zeros((im_shape[1],ref_image_size,ref_image_size))
+
+            # For each image in the ADI stak
+            for j in range(im_shape[1]):
+                # Prapre centering frame
+                center_frame, _ = _get_center(w, j, self.m_center)
+
+                center_frame_unsharp = center_frame - gaussian_filter(input=center_frame,
+                                                                  sigma=self.m_sigma)
+                sat_spot = np.zeros((4,ref_image_size,ref_image_size))
+                
+                # Loop for 4 waffle spots
+                for i in range(4):
+                    # Approximate positions of waffle spots
+                    radius = self.m_radius * wave_nr / wavelength_min
+
+                    x_0 = np.floor(self.m_center[0] + radius *
+                                np.cos(self.m_angle*np.pi/180 + np.pi / 4. * (2 * i)))
+
+                    y_0 = np.floor(self.m_center[1] + radius *
+                                np.sin(self.m_angle*np.pi/180 + np.pi / 4. * (2 * i)))
+
+                    tmp_center_frame = crop_image(image=center_frame_unsharp,
+                                                center=(int(y_0), int(x_0)),
+                                                size=ref_image_size)
+
+                    # find maximum in tmp image
+                    coords = np.unravel_index(indices=np.argmax(tmp_center_frame),
+                                            shape=tmp_center_frame.shape)
+
+                    y_max, x_max = coords[0], coords[1]
+
+                    pixmax = tmp_center_frame[y_max, x_max]
+                    max_pos = np.array([x_max, y_max]).reshape(1, 2)
+
+                    # Check whether it is the correct maximum: second brightest pixel should be nearby
+                    tmp_center_frame[y_max, x_max] = 0.
+
+                    # introduce distance parameter
+                    dist = np.inf
+
+                    while dist > 2:
+                        coords = np.unravel_index(indices=np.argmax(tmp_center_frame),
+                                                shape=tmp_center_frame.shape)
+
+                        y_max_new, x_max_new = coords[0], coords[1]
+
+                        pixmax_new = tmp_center_frame[y_max_new, x_max_new]
+
+                        # Caculate minimal distance to previous points
+                        tmp_center_frame[y_max_new, x_max_new] = 0.
+
+                        dist = np.amin(np.linalg.norm(np.vstack((max_pos[:, 0]-x_max_new,
+                                                                max_pos[:, 1]-y_max_new)),
+                                                    axis=0))
+
+                        if dist <= 2 and pixmax_new < pixmax:
+                            break
+
+                        max_pos = np.vstack((max_pos, [x_max_new, y_max_new]))
+
+                        x_max = x_max_new
+                        y_max = y_max_new
+                        pixmax = pixmax_new
+
+                    x_0 = x_0 - (ref_image_size-1)/2 + x_max
+                    y_0 = y_0 - (ref_image_size-1)/2 + y_max
+
+                    # create reference image around determined maximum
+                    ref_center_frame = crop_image(image=center_frame_unsharp,
+                                                center=(int(y_0), int(x_0)),
+                                                size=ref_image_size)
+
+                    # Fit the data using astropy.modeling
+                    gauss_init = models.Gaussian2D(amplitude=np.amax(ref_center_frame),
+                                                x_mean=x_0,
+                                                y_mean=y_0,
+                                                x_stddev=1.,
+                                                y_stddev=1.,
+                                                theta=0.)
+
+                    fit_gauss = fitting.LevMarLSQFitter()
+
+                    y_grid, x_grid = np.mgrid[y_0-(ref_image_size-1)/2:y_0+(ref_image_size-1)/2+1,
+                                            x_0-(ref_image_size-1)/2:x_0+(ref_image_size-1)/2+1]
+
+                    gauss = fit_gauss(gauss_init,
+                                    x_grid,
+                                    y_grid,
+                                    ref_center_frame)
+                    #print(x_0,x_max,gauss.x_mean.value)
+                    #print(y_0,y_max,gauss.y_mean.value)
+                    x_pos[i] = gauss.x_mean.value + ref_image_size/2
+                    y_pos[i] = gauss.y_mean.value + ref_image_size/2
+                    sat_spot[i] = crop_image(image=center_frame,
+                                        center=(int(y_pos[i]), int(x_pos[i])),
+                                        size=ref_image_size)
+                                
+                if self.combine == 'mean':
+                    sat_spots_wlen[j] = np.mean(sat_spot, axis = 0)
+                elif self.combine == 'median':
+                    sat_spots_wlen[j] = np.median(sat_spot, axis=0)
+                else:
+                    sat_spots_wlen[j] = sat_spot
+            sat_spots[w] = sat_spots_wlen
+        self.m_image_out_port.set_all(sat_spots)
+        self.m_image_out_port.copy_attributes(self.m_image_in_port)
+        self.m_image_out_port.add_history('SatelliteSpotExtractModule', "Extracted and combined satellite spots.")
+        self.m_image_out_port.close_port()
